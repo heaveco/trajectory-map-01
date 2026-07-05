@@ -9,6 +9,10 @@ let warpContainer;
 let pendingLocation = null;
 let editingPinId = null;
 
+// [NEW] リアルタイムGPSトラッキング用変数
+let watchId = null;
+let userMarker = null;
+
 function initMap() {
     trajectoryMap = new maplibregl.Map({
         container: 'map',
@@ -25,26 +29,105 @@ function initMap() {
         zoom: 12
     });
 
-    // モード切替ロジック
     const btnExplore = document.getElementById('btn-mode-explore');
     const btnCreate = document.getElementById('btn-mode-create');
+    const btnGuide = document.getElementById('btn-mode-guide'); // [NEW]
     const btnCurrentLoc = document.getElementById('btn-current-loc');
 
-    btnExplore.addEventListener('click', () => {
-        appMode = 'EXPLORE';
-        btnExplore.style.background = '#fff'; btnExplore.style.color = '#000'; btnExplore.style.fontWeight = 'bold';
-        btnCreate.style.background = '#222'; btnCreate.style.color = '#aaa'; btnCreate.style.fontWeight = 'normal';
-        trajectoryMap.getCanvas().style.cursor = '';
-        btnCurrentLoc.style.display = 'none';
+    // [NEW] モード切替を管理する関数
+    function switchMode(newMode) {
+        appMode = newMode;
+
+        // ボタンの見た目をリセット
+        [btnExplore, btnCreate, btnGuide].forEach(btn => {
+            btn.style.background = '#222';
+            btn.style.color = '#aaa';
+            btn.style.fontWeight = 'normal';
+        });
+
+        // 選択されたボタンをハイライト
+        const activeBtn = appMode === 'EXPLORE' ? btnExplore : (appMode === 'CREATE' ? btnCreate : btnGuide);
+        activeBtn.style.background = '#fff';
+        activeBtn.style.color = '#000';
+        activeBtn.style.fontWeight = 'bold';
+
+        // UIとカーソルの変更
+        trajectoryMap.getCanvas().style.cursor = appMode === 'CREATE' ? 'crosshair' : '';
+        btnCurrentLoc.style.display = appMode === 'CREATE' ? 'block' : 'none';
+
+        // 案内モードの処理: リアルタイムGPS追跡を開始
+        if (appMode === 'GUIDE') {
+            if (!navigator.geolocation) {
+                alert("この端末はGPSに対応していません。");
+                return;
+            }
+            if (!watchId) {
+                watchId = navigator.geolocation.watchPosition(
+                    (position) => {
+                        const lat = position.coords.latitude;
+                        const lng = position.coords.longitude;
+                        
+                        // compass.js 向けにグローバルの現在地を更新
+                        if (window.updateLocation) {
+                            window.updateLocation(lng, lat);
+                        }
+
+                        // マップ上に現在地(青い点)を描画・更新
+                        if (!userMarker) {
+                            const el = document.createElement('div');
+                            el.style.width = '16px'; el.style.height = '16px';
+                            el.style.background = '#007aff'; 
+                            el.style.borderRadius = '50%';
+                            el.style.border = '2px solid #fff'; 
+                            el.style.boxShadow = '0 0 10px rgba(0,122,255,0.8)';
+                            
+                            userMarker = new maplibregl.Marker({ element: el })
+                                .setLngLat([lng, lat])
+                                .addTo(trajectoryMap);
+                            
+                            trajectoryMap.flyTo({ center: [lng, lat], zoom: 16 });
+                        } else {
+                            userMarker.setLngLat([lng, lat]);
+                        }
+                    },
+                    (error) => { console.warn("GPSの追跡に失敗しました", error); },
+                    { enableHighAccuracy: true, timeout: 5000, maximumAge: 0 }
+                );
+            }
+        } else {
+            // 案内モード以外ならトラッキングを停止してリソースを節約
+            if (watchId) {
+                navigator.geolocation.clearWatch(watchId);
+                watchId = null;
+            }
+            if (userMarker) {
+                userMarker.remove();
+                userMarker = null;
+            }
+        }
+    }
+
+    // ボタンクリックイベントの設定
+    btnExplore.addEventListener('click', () => switchMode('EXPLORE'));
+    btnCreate.addEventListener('click', () => switchMode('CREATE'));
+    
+    // [NEW] 案内モード起動時のコンパス許可（iPhone Safari専用対応）
+    btnGuide.addEventListener('click', async () => {
+        if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+            try {
+                const permission = await DeviceOrientationEvent.requestPermission();
+                if (permission !== 'granted') {
+                    alert("コンパスへのアクセスが拒否されました。方角は動作しません。");
+                }
+            } catch (err) {
+                console.error("コンパス権限エラー:", err);
+            }
+        }
+        switchMode('GUIDE');
     });
 
-    btnCreate.addEventListener('click', () => {
-        appMode = 'CREATE';
-        btnCreate.style.background = '#fff'; btnCreate.style.color = '#000'; btnCreate.style.fontWeight = 'bold';
-        btnExplore.style.background = '#222'; btnExplore.style.color = '#aaa'; btnExplore.style.fontWeight = 'normal';
-        trajectoryMap.getCanvas().style.cursor = 'crosshair';
-        btnCurrentLoc.style.display = 'block';
-    });
+    // アプリ起動時の初期モード
+    switchMode('EXPLORE');
 
     // DOM要素の取得
     modal = document.getElementById('pin-modal');
@@ -57,7 +140,7 @@ function initMap() {
         loadPins(query);
     });
 
-    // 現在地ボタンの処理 (GPS取得)
+    // 現在地ボタンの処理 (記録モードでの単発取得)
     btnCurrentLoc.addEventListener('click', () => {
         if (!navigator.geolocation) {
             alert("この端末はGPSに対応していません。");
@@ -97,7 +180,7 @@ function initMap() {
 
     // 地図クリック時 (手動でピンを打つ)
     trajectoryMap.on('click', (e) => {
-        if (appMode === 'EXPLORE') return;
+        if (appMode !== 'CREATE') return; // CREATEモード以外では何もしない
 
         editingPinId = null; 
         pendingLocation = e.lngLat;
@@ -255,12 +338,16 @@ function addMarkerToMap(pinId, lng, lat, title) {
     marker.getElement().addEventListener('click', async (e) => {
         e.stopPropagation(); 
 
-        if (appMode === 'EXPLORE') {
+        // [変更] EXPLORE または GUIDE モード時は、ピンをターゲットとして設定する
+        if (appMode === 'EXPLORE' || appMode === 'GUIDE') {
             window.targetPinId = pinId;
             window.targetLoc = [lng, lat];
             alert(`【${title}】をターゲットに設定しました！`);
-            window.updateLocation(lng, lat);
-
+            
+            // 現在地が取得できている場合は即座にHUD（コンパス）を更新
+            if (window.currentLoc) {
+                window.updateLocation(window.currentLoc[0], window.currentLoc[1]);
+            }
         } else if (appMode === 'CREATE') {
             try {
                 const pinDetail = await API.getPinDetail(pinId);
