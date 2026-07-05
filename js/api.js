@@ -1,9 +1,7 @@
 /**
  * 軌跡のマップ - ローカルAPIクライアント (サーバーレス版)
- * FastAPIの代わりに、ブラウザ内蔵のIndexedDB (Dexie.js) にデータを保存します。
  */
 
-// 1. ローカルデータベースの定義（SQLiteのテーブル設計を再現）
 const db = new Dexie("TrajectoryDB");
 db.version(1).stores({
     pins: 'pin_id, title, latitude, longitude, status',
@@ -12,14 +10,8 @@ db.version(1).stores({
     topologyEdges: 'edge_id, node_a, node_b' 
 });
 
-// --- ユーティリティ関数 ---
+function generateUUID() { return crypto.randomUUID ? crypto.randomUUID() : 'xxxx-xxxx-xxxx'.replace(/[x]/g, () => (Math.random()*16|0).toString(16)); }
 
-// 簡易的なUUID生成
-function generateUUID() {
-    return crypto.randomUUID ? crypto.randomUUID() : 'xxxx-xxxx-xxxx'.replace(/[x]/g, () => (Math.random()*16|0).toString(16));
-}
-
-// 簡易的なハッシュ生成 (SHA-256)
 async function generateHash(pinId, lat, lng, parentHash = null) {
     const data = JSON.stringify({ pin_id: pinId, lat, lng, parent_hash: parentHash });
     const msgBuffer = new TextEncoder().encode(data);
@@ -28,36 +20,27 @@ async function generateHash(pinId, lat, lng, parentHash = null) {
     return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
-// ローカル用の簡易暗号化モック (UXを維持するためのパスワードロック機能)
 function mockEncrypt(text, password) {
-    const pwd = password || "";
-    const msg = text || "";
-    return btoa(encodeURIComponent(pwd + ":::" + msg));
+    return btoa(encodeURIComponent((password || "") + ":::" + (text || "")));
 }
 
 function mockDecrypt(encryptedData, password) {
-    const pwd = password || "";
     try {
         const decoded = decodeURIComponent(atob(encryptedData));
-        const prefix = pwd + ":::";
-        if (decoded.startsWith(prefix)) {
-            return decoded.substring(prefix.length);
-        } else {
-            throw new Error("Password mismatch");
-        }
+        const prefix = (password || "") + ":::";
+        if (decoded.startsWith(prefix)) return decoded.substring(prefix.length);
+        throw new Error("Password mismatch");
     } catch (e) {
         throw new Error("パスワードが間違っているか、データが破損しています。");
     }
 }
 
-// --- APIの実装 (map.jsからの呼び出し口) ---
 const API = {
     async createPin(pinData) {
         const pinId = generateUUID();
         const now = Date.now();
         let title = pinData.title;
 
-        // 名前の自動生成
         if (!title) {
             const count = await db.pins.count();
             title = `名無しの場所${count + 1}`;
@@ -66,13 +49,13 @@ const API = {
         const encData = mockEncrypt(pinData.image_text, pinData.password);
         const genesisHash = await generateHash(pinId, pinData.latitude, pinData.longitude);
 
-        // トランザクションで一括保存
         await db.transaction('rw', db.pins, db.payloads, db.hashChains, db.topologyEdges, async () => {
             await db.pins.add({
                 pin_id: pinId, title: title,
                 latitude: pinData.latitude, longitude: pinData.longitude,
                 mode: pinData.mode || "A", owner_id: "local_user",
-                created_at: now, status: "ACTIVE"
+                created_at: now, status: "ACTIVE",
+                is_public: pinData.is_public || false // [NEW] 放流フラグの保存
             });
 
             await db.payloads.add({ pin_id: pinId, encrypted_data: encData });
@@ -80,20 +63,22 @@ const API = {
 
             if (pinData.warps && pinData.warps.length > 0) {
                 for (const warp of pinData.warps) {
-                    await db.topologyEdges.add({
-                        edge_id: generateUUID(),
-                        node_a: pinId, node_b: warp.target_pin_id,
-                        cost_minutes: warp.cost_minutes, memo: warp.memo
-                    });
+                    await db.topologyEdges.add({ edge_id: generateUUID(), node_a: pinId, node_b: warp.target_pin_id, cost_minutes: warp.cost_minutes, memo: warp.memo });
                 }
             }
         });
-
         return { status: "success", pin_id: pinId, hash: genesisHash };
     },
 
-    async getNearbyPins(searchQuery = "") {
+    // [NEW] appMode を受け取り、EXPLORE/GUIDE モードの時は放流済みのみを返す
+    async getNearbyPins(searchQuery = "", appMode = "EXPLORE") {
         let pins = await db.pins.where('status').equals('ACTIVE').toArray();
+        
+        // 探索・案内モードでは「放流済み (is_public == true)」のピンだけを抽出
+        if (appMode === 'EXPLORE' || appMode === 'GUIDE') {
+            pins = pins.filter(p => p.is_public === true);
+        }
+
         if (searchQuery) {
             pins = pins.filter(p => p.title && p.title.includes(searchQuery));
         }
@@ -105,39 +90,33 @@ const API = {
         if (!pin) throw new Error("ピンが見つかりません");
 
         const edges = await db.topologyEdges.where('node_a').equals(pinId).toArray();
-        const warps = edges.map(e => ({
-            target_pin_id: e.node_b,
-            cost_minutes: e.cost_minutes,
-            memo: e.memo
-        }));
-
         return {
             pin_id: pin.pin_id, title: pin.title,
             latitude: pin.latitude, longitude: pin.longitude,
-            warps: warps
+            is_public: pin.is_public || false, // [NEW] 放流フラグを取得
+            warps: edges.map(e => ({ target_pin_id: e.node_b, cost_minutes: e.cost_minutes, memo: e.memo }))
         };
     },
 
     async updatePin(pinId, pinData) {
         await db.transaction('rw', db.pins, db.payloads, db.topologyEdges, async () => {
-            if (pinData.title) await db.pins.update(pinId, { title: pinData.title });
+            const updates = {};
+            if (pinData.title !== undefined) updates.title = pinData.title;
+            if (pinData.is_public !== undefined) updates.is_public = pinData.is_public; // [NEW] 放流フラグの更新
+
+            if (Object.keys(updates).length > 0) await db.pins.update(pinId, updates);
 
             if (pinData.image_text !== null && pinData.password !== null) {
                 const encData = mockEncrypt(pinData.image_text, pinData.password);
                 await db.payloads.update(pinId, { encrypted_data: encData });
             }
 
-            // ワープ情報の再構築
             const existingEdges = await db.topologyEdges.where('node_a').equals(pinId).primaryKeys();
             await db.topologyEdges.bulkDelete(existingEdges);
 
             if (pinData.warps && pinData.warps.length > 0) {
                 for (const warp of pinData.warps) {
-                    await db.topologyEdges.add({
-                        edge_id: generateUUID(),
-                        node_a: pinId, node_b: warp.target_pin_id,
-                        cost_minutes: warp.cost_minutes, memo: warp.memo
-                    });
+                    await db.topologyEdges.add({ edge_id: generateUUID(), node_a: pinId, node_b: warp.target_pin_id, cost_minutes: warp.cost_minutes, memo: warp.memo });
                 }
             }
         });
@@ -150,8 +129,6 @@ const API = {
         if (!pin || !payload) throw new Error("ピンが見つかりません。");
 
         const decryptedText = mockDecrypt(payload.encrypted_data, requestData.password);
-
-        // 最新のハッシュ履歴を取得
         const chains = await db.hashChains.where('pin_id').equals(pinId).toArray();
         chains.sort((a, b) => b.timestamp - a.timestamp);
         const currentHash = chains.length > 0 ? chains[0].hash : null;
@@ -164,9 +141,6 @@ const API = {
             await db.pins.update(pinId, { owner_id: "local_user" });
         });
 
-        return {
-            status: "success", new_hash: newHash,
-            decrypted_image_base64: decryptedText, message: "所有権の移転と復号に成功しました。"
-        };
+        return { status: "success", new_hash: newHash, decrypted_image_base64: decryptedText, message: "所有権の移転と復号に成功しました。" };
     }
 };
