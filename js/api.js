@@ -74,8 +74,9 @@ const API = {
     async getNearbyPins(searchQuery = "", appMode = "EXPLORE") {
         let pins = await db.pins.where('status').equals('ACTIVE').toArray();
         
-        // 探索・案内モードでは「放流済み (is_public == true)」のピンだけを抽出
-        if (appMode === 'EXPLORE' || appMode === 'GUIDE') {
+        // 探索モードでは「放流済み (is_public == true)」のピンだけを抽出
+        //旧: 探索・案内双方非表示(appMode === 'EXPLORE' || appMode === 'GUIDE')
+        if (appMode === 'EXPLORE') {
             pins = pins.filter(p => p.is_public === true);
         }
 
