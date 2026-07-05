@@ -136,6 +136,7 @@ function initMap() {
         const warps = [];
         const warpRows = warpContainer.children;
         for (let i = 0; i < warpRows.length; i++) {
+            const row = warpRows[i];
             const dest = warpRows[i].querySelector('.warp-dest').value;
             const cost = row.querySelector('.warp-cost').value;
             const memo = warpRows[i].querySelector('.warp-memo').value;
